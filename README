@@ -1,0 +1,15 @@
+Usage: main <command> [options]
+
+Commands:
+  crawl    Collect YouTube IDs from the Khan Academy sitemaps
+  resolve  Resolve collected YouTube IDs to Khan Academy content IDs
+  watch    Watch the resolved videos on your account to mark them complete
+
+Options:
+  --fresh          Ignore saved progress and start over
+  --data-dir DIR   Directory for state and output (default: data)
+  --base-url URL   Site root (default: https://www.khanacademy.org)
+
+Environment:
+  KA_IMPERSONATE   libcurl-impersonate target (default: chrome152)
+  KAAS             KAAS session cookie of the account to watch as (watch)
