@@ -2,21 +2,15 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
-#include <chrono>
 #include <cstddef>
-#include <expected>
 #include <filesystem>
-#include <iomanip>
+#include <format>
 #include <iostream>
+#include <iterator>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
-#include <system_error>
-#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -24,19 +18,12 @@
 #include "src/http.h"
 #include "src/journal.h"
 #include "src/progress.h"
+#include "src/result.h"
+#include "src/run.h"
+#include "src/text.h"
 
 namespace khanbot {
 namespace {
-
-constexpr int kWorkers = 4;
-constexpr int kAttempts = 3;
-constexpr int kMaxConsecutiveFailures = 5;
-constexpr int kMaxFailuresShown = 10;
-constexpr std::size_t kYoutubeIdLength = 11;
-constexpr std::chrono::milliseconds kRequestDelay{150};
-constexpr std::chrono::milliseconds kRetryBackoff{500};
-constexpr std::size_t kNpos = std::string_view::npos;
-
 constexpr char kJournalName[] = "crawl.journal";
 constexpr char kYoutubeIdsName[] = "youtube_ids.txt";
 constexpr char kOrphanUrlsName[] = "no_youtube.txt";
@@ -51,11 +38,6 @@ struct SitemapRecord {
     std::string path;
     std::vector<std::string> youtube_ids;
     std::vector<std::string> orphan_urls;
-};
-
-struct FetchFailure {
-    std::string message;
-    Response response;
 };
 
 struct ExportStats {
@@ -77,19 +59,15 @@ Between(std::string_view text, std::string_view open, std::string_view close) {
 }
 
 std::string_view Trim(std::string_view text) {
-    while (!text.empty() &&
-           std::isspace(static_cast<unsigned char>(text.front())))
+    while (!text.empty() && IsAsciiSpace(text.front()))
         text.remove_prefix(1);
-    while (!text.empty() &&
-           std::isspace(static_cast<unsigned char>(text.back())))
+    while (!text.empty() && IsAsciiSpace(text.back()))
         text.remove_suffix(1);
     return text;
 }
 
 bool HasWhitespace(std::string_view text) {
-    return std::any_of(text.begin(), text.end(), [](char c) {
-        return std::isspace(static_cast<unsigned char>(c)) != 0;
-    });
+    return std::ranges::any_of(text, IsAsciiSpace);
 }
 
 std::vector<std::string> ExtractLocs(std::string_view xml) {
@@ -127,22 +105,12 @@ bool IsVideoUrl(std::string_view url) {
 }
 
 std::string ExtractYoutubeId(std::string_view block) {
-    std::size_t position = block.find(kYoutubeMarker);
-    if (position == kNpos)
+    const std::size_t marker = block.find(kYoutubeMarker);
+    if (marker == kNpos)
         return {};
-    position += kYoutubeMarker.size();
-    std::size_t length = 0;
-    while (length < kYoutubeIdLength && position + length < block.size()) {
-        const char c = block[position + length];
-        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' &&
-            c != '-') {
-            break;
-        }
-        ++length;
-    }
-    return length == kYoutubeIdLength
-               ? std::string(block.substr(position, length))
-               : std::string();
+    const std::string_view id =
+        block.substr(marker + kYoutubeMarker.size(), kYoutubeIdLength);
+    return IsYoutubeId(id) ? std::string(id) : std::string();
 }
 
 SitemapRecord ParseUrlset(const std::string &path, std::string_view xml) {
@@ -157,7 +125,7 @@ SitemapRecord ParseUrlset(const std::string &path, std::string_view xml) {
         position = following;
         const std::optional<std::string_view> loc =
             Between(block, kLocOpen, kLocClose);
-        if (!loc.has_value())
+        if (!loc)
             continue;
         const std::string_view url = Trim(*loc);
         if (!IsVideoUrl(url) || HasWhitespace(url))
@@ -214,11 +182,9 @@ std::optional<SitemapRecord> ParseJournalLine(std::string_view line) {
     const std::vector<std::string_view> fields = Split(line, '\t');
     if (fields.size() != 3 || fields[0].empty())
         return std::nullopt;
-    SitemapRecord record;
-    record.path = std::string(fields[0]);
-    record.youtube_ids = ParseList(fields[1]);
-    record.orphan_urls = ParseList(fields[2]);
-    return record;
+    return SitemapRecord{.path = std::string(fields[0]),
+                         .youtube_ids = ParseList(fields[1]),
+                         .orphan_urls = ParseList(fields[2])};
 }
 
 bool IsValidJournalLine(std::string_view line) {
@@ -228,61 +194,49 @@ bool IsValidJournalLine(std::string_view line) {
 std::vector<SitemapRecord> LoadRecords(const Journal &journal) {
     std::vector<SitemapRecord> records;
     for (const std::string &line : journal.Snapshot()) {
-        std::optional<SitemapRecord> record = ParseJournalLine(line);
-        if (record.has_value())
+        if (std::optional<SitemapRecord> record = ParseJournalLine(line))
             records.push_back(std::move(*record));
     }
     return records;
 }
 
-std::expected<std::string, FetchFailure>
-FetchXml(Http &http, const std::string &url, std::string_view marker,
-         const std::atomic<bool> &stop) {
-    FetchFailure failure;
-    for (int attempt = 1; attempt <= kAttempts; ++attempt) {
-        if (stop.load()) {
-            failure.message = "interrupted";
-            return std::unexpected(std::move(failure));
-        }
-        std::expected<Response, std::string> result = http.Get(url);
-        if (result.has_value() && result->status == 200 &&
-            result->body.find(marker) != std::string::npos) {
+Result<std::string, FetchFailure> FetchXml(Http &http, const std::string &url,
+                                           std::string_view marker,
+                                           const std::atomic<bool> &stop) {
+    return Retry<std::string>(stop, [&]() -> Result<std::string, FetchFailure> {
+        Result<Response> result = http.Get(url);
+        if (!result)
+            return Failed(std::move(result.error()));
+        if (result->status == kHttpOk && result->body.contains(marker))
             return std::move(result->body);
-        }
-        if (result.has_value()) {
-            failure.response = std::move(*result);
-            failure.message = DescribeResponse(failure.response);
-        } else {
-            failure.message = result.error();
-        }
-        if (attempt < kAttempts)
-            std::this_thread::sleep_for(kRetryBackoff * attempt);
-    }
-    failure.message =
-        "after " + std::to_string(kAttempts) + " attempts: " + failure.message;
-    return std::unexpected(std::move(failure));
+        std::string message = DescribeResponse(*result);
+        return Failed(std::move(message), std::move(*result));
+    });
 }
 
-std::expected<ExportStats, std::string>
-ExportResults(const std::vector<SitemapRecord> &records,
-              const std::filesystem::path &directory) {
+Result<ExportStats> ExportResults(const std::vector<SitemapRecord> &records,
+                                  const std::filesystem::path &directory) {
     ExportStats stats;
-    std::set<std::string> ids;
-    std::set<std::string> orphans;
+    std::vector<std::string> ids;
+    std::vector<std::string> orphans;
     for (const SitemapRecord &record : records) {
         stats.total_ids += record.youtube_ids.size();
-        ids.insert(record.youtube_ids.begin(), record.youtube_ids.end());
-        orphans.insert(record.orphan_urls.begin(), record.orphan_urls.end());
+        ids.insert(ids.end(), record.youtube_ids.begin(),
+                   record.youtube_ids.end());
+        orphans.insert(orphans.end(), record.orphan_urls.begin(),
+                       record.orphan_urls.end());
     }
+    SortUnique(ids);
+    SortUnique(orphans);
     stats.unique_ids = ids.size();
     stats.orphan_urls = orphans.size();
     if (auto written = WriteLinesAtomically(directory / kYoutubeIdsName, ids);
-        !written.has_value()) {
+        !written) {
         return std::unexpected(written.error());
     }
     if (auto written =
             WriteLinesAtomically(directory / kOrphanUrlsName, orphans);
-        !written.has_value()) {
+        !written) {
         return std::unexpected(written.error());
     }
     return stats;
@@ -296,63 +250,23 @@ class Crawler {
     RunStatus Run();
 
   private:
-    struct Failed {
-        std::string path;
-        std::string message;
-    };
-
-    std::expected<std::vector<std::string>, std::string>
-    LoadSitemapPaths(Http &http);
+    Result<std::vector<std::string>> LoadSitemapPaths(Http &http);
     void Work(Http &http, Progress &progress);
-    void RecordFailure(const std::string &path, std::string message,
-                       Progress &progress);
-    void Abort(std::string reason);
     RunStatus Finish(const std::vector<std::string> &paths);
-    RunStatus Fatal(const std::string &message) const;
 
     const CommandOptions options_;
     const std::atomic<bool> &stop_;
     std::unique_ptr<Journal> journal_;
     std::vector<std::string> pending_;
     std::atomic<std::size_t> next_{0};
-    std::atomic<int> consecutive_failures_{0};
-    std::atomic<bool> abort_{false};
-    std::mutex mutex_;
-    std::vector<Failed> failures_;
-    std::string abort_reason_;
+    FailureLog log_;
 };
 
-RunStatus Crawler::Fatal(const std::string &message) const {
-    std::cerr << "error: " << message << '\n';
-    return RunStatus::kFatal;
-}
-
-void Crawler::Abort(std::string reason) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (abort_reason_.empty())
-        abort_reason_ = std::move(reason);
-    abort_.store(true);
-}
-
-void Crawler::RecordFailure(const std::string &path, std::string message,
-                            Progress &progress) {
-    progress.Fail();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        failures_.push_back({path, std::move(message)});
-    }
-    if (consecutive_failures_.fetch_add(1) + 1 >= kMaxConsecutiveFailures) {
-        Abort(std::to_string(kMaxConsecutiveFailures) +
-              " consecutive failures; the site may be challenging requests");
-    }
-}
-
-std::expected<std::vector<std::string>, std::string>
-Crawler::LoadSitemapPaths(Http &http) {
+Result<std::vector<std::string>> Crawler::LoadSitemapPaths(Http &http) {
     const std::string url = options_.base_url + "/sitemap.xml";
-    std::expected<std::string, FetchFailure> index =
+    Result<std::string, FetchFailure> index =
         FetchXml(http, url, "<sitemapindex", stop_);
-    if (!index.has_value()) {
+    if (!index) {
         const FetchFailure &failure = index.error();
         std::string message =
             "could not load the sitemap index: " + failure.message;
@@ -379,129 +293,89 @@ Crawler::LoadSitemapPaths(Http &http) {
 }
 
 void Crawler::Work(Http &http, Progress &progress) {
-    while (!stop_.load() && !abort_.load()) {
+    while (!stop_.load() && !log_.aborted()) {
         const std::size_t index = next_.fetch_add(1);
         if (index >= pending_.size())
             return;
         const std::string &path = pending_[index];
-        std::expected<std::string, FetchFailure> body =
+        Result<std::string, FetchFailure> body =
             FetchXml(http, options_.base_url + path, "<urlset", stop_);
-        if (!body.has_value()) {
+        if (!body) {
             if (stop_.load())
                 return;
-            RecordFailure(path, std::move(body.error().message), progress);
+            progress.Fail();
+            log_.Record(path, std::move(body.error().message));
             continue;
         }
         const SitemapRecord record = ParseUrlset(path, *body);
         if (!journal_->Append(FormatJournalLine(record))) {
-            Abort("cannot write " + std::string(kJournalName));
+            log_.Abort("cannot write " + std::string(kJournalName));
             return;
         }
-        consecutive_failures_.store(0);
+        log_.Succeeded();
         progress.Advance(record.youtube_ids.size() + record.orphan_urls.size());
-        std::this_thread::sleep_for(kRequestDelay);
+        WaitFor(stop_, kRequestDelay);
     }
 }
 
 RunStatus Crawler::Finish(const std::vector<std::string> &paths) {
-    const std::vector<SitemapRecord> records = LoadRecords(*journal_);
-    const std::expected<ExportStats, std::string> exported =
-        ExportResults(records, options_.data_dir);
-    if (!exported.has_value())
+    const Result<ExportStats> exported =
+        ExportResults(LoadRecords(*journal_), options_.data_dir);
+    if (!exported)
         return Fatal(exported.error());
 
-    std::size_t crawled = 0;
-    for (const std::string &path : paths) {
-        if (journal_->Contains(path))
-            ++crawled;
-    }
-    const bool interrupted = stop_.load();
-    const bool incomplete = abort_.load() || !failures_.empty();
-
-    std::cout << (interrupted  ? "Crawl interrupted"
-                  : incomplete ? "Crawl incomplete"
-                               : "Crawl complete")
-              << '\n'
-              << "  Sitemaps  " << FormatCount(crawled) << " of "
-              << FormatCount(paths.size()) << " crawled\n"
-              << "  Videos    " << FormatCount(exported->unique_ids)
-              << " unique YouTube IDs from " << FormatCount(exported->total_ids)
-              << " entries\n"
-              << "  No ID     " << FormatCount(exported->orphan_urls)
-              << " video URLs without a YouTube ID\n"
-              << "  Output    "
-              << (options_.data_dir / kYoutubeIdsName).string()
-              << "\n            "
-              << (options_.data_dir / kOrphanUrlsName).string() << '\n';
-
-    int shown = 0;
-    for (const Failed &failed : failures_) {
-        if (shown++ == kMaxFailuresShown) {
-            std::cerr << "  ... and "
-                      << FormatCount(failures_.size() - kMaxFailuresShown)
-                      << " more\n";
-            break;
-        }
-        std::cerr << "  failed  " << failed.path << "  " << failed.message
-                  << '\n';
-    }
-    if (abort_.load())
-        std::cerr << "Stopped early: " << abort_reason_ << '\n';
-    if (interrupted) {
-        std::cerr << "Progress is saved; run again to resume.\n";
-        return RunStatus::kInterrupted;
-    }
-    if (incomplete) {
-        std::cerr << "Run again to retry the sitemaps that did not finish.\n";
-        return RunStatus::kIncomplete;
-    }
-    return RunStatus::kComplete;
+    const auto crawled = static_cast<std::size_t>(
+        std::ranges::count_if(paths, [&](const std::string &path) {
+            return journal_->Contains(path);
+        }));
+    const std::string details = std::format(
+        "  Sitemaps  {} of {} crawled\n"
+        "  Videos    {} unique YouTube IDs from {} entries\n"
+        "  No ID     {} video URLs without a YouTube ID\n"
+        "  Output    {}\n"
+        "            {}",
+        FormatCount(crawled), FormatCount(paths.size()),
+        FormatCount(exported->unique_ids), FormatCount(exported->total_ids),
+        FormatCount(exported->orphan_urls),
+        (options_.data_dir / kYoutubeIdsName).string(),
+        (options_.data_dir / kOrphanUrlsName).string());
+    return Report("Crawl", "sitemaps", stop_.load(), log_, details);
 }
 
 RunStatus Crawler::Run() {
-    std::error_code error;
-    std::filesystem::create_directories(options_.data_dir, error);
-    if (error) {
-        return Fatal("cannot create " + options_.data_dir.string() + ": " +
-                     error.message());
-    }
+    if (const Result<void> made = EnsureDirectory(options_.data_dir); !made)
+        return Fatal(made.error());
 
-    std::expected<std::unique_ptr<Journal>, std::string> journal =
-        Journal::Open(options_.data_dir / kJournalName, options_.fresh,
-                      IsValidJournalLine);
-    if (!journal.has_value())
+    Result<std::unique_ptr<Journal>> journal = Journal::Open(
+        options_.data_dir / kJournalName, options_.fresh, IsValidJournalLine);
+    if (!journal)
         return Fatal(journal.error());
     journal_ = std::move(*journal);
 
-    std::vector<std::unique_ptr<Http>> clients;
-    for (int i = 0; i < kWorkers; ++i) {
-        std::expected<std::unique_ptr<Http>, std::string> client =
-            Http::Create();
-        if (!client.has_value())
-            return Fatal(client.error());
-        clients.push_back(std::move(*client));
-    }
+    const Result<std::vector<std::unique_ptr<Http>>> clients =
+        CreateClients(kWorkers);
+    if (!clients)
+        return Fatal(clients.error());
 
-    const std::expected<std::vector<std::string>, std::string> paths =
-        LoadSitemapPaths(*clients.front());
-    if (!paths.has_value()) {
+    const Result<std::vector<std::string>> paths =
+        LoadSitemapPaths(*clients->front());
+    if (!paths) {
         if (stop_.load())
             return RunStatus::kInterrupted;
         return Fatal(paths.error());
     }
 
-    for (const std::string &path : *paths) {
-        if (!journal_->Contains(path))
-            pending_.push_back(path);
-    }
+    std::ranges::copy_if(
+        *paths, std::back_inserter(pending_),
+        [&](const std::string &path) { return !journal_->Contains(path); });
     std::size_t known_items = 0;
-    for (const SitemapRecord &record : LoadRecords(*journal_)) {
+    for (const SitemapRecord &record : LoadRecords(*journal_))
         known_items += record.youtube_ids.size() + record.orphan_urls.size();
-    }
-    std::cerr << "Sitemap index: " << FormatCount(paths->size())
-              << " sitemaps, " << FormatCount(paths->size() - pending_.size())
-              << " already crawled, " << FormatCount(pending_.size())
-              << " to fetch\n";
+    std::cerr << std::format(
+        "Sitemap index: {} sitemaps, {} already crawled, {} to fetch\n",
+        FormatCount(paths->size()),
+        FormatCount(paths->size() - pending_.size()),
+        FormatCount(pending_.size()));
 
     if (!pending_.empty()) {
         Progress progress(Progress::Options{
@@ -511,13 +385,7 @@ RunStatus Crawler::Run() {
             .completed = paths->size() - pending_.size(),
             .extra = known_items,
         });
-        {
-            std::vector<std::jthread> pool;
-            for (const std::unique_ptr<Http> &client : clients) {
-                pool.emplace_back(
-                    [this, &client, &progress] { Work(*client, progress); });
-            }
-        }
+        RunWorkers(*clients, [&](Http &http) { Work(http, progress); });
         progress.Finish();
     }
     return Finish(*paths);

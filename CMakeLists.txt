@@ -76,8 +76,10 @@ target_include_directories(glaze_headers SYSTEM INTERFACE ${glaze_SOURCE_DIR}/in
 add_library(khanbot_core STATIC
   src/crawl.cc
   src/http.cc
+  src/journal.cc
   src/progress.cc
   src/resolve.cc
+  src/run.cc
   src/watch.cc
 )
 target_include_directories(khanbot_core PUBLIC ${PROJECT_SOURCE_DIR})

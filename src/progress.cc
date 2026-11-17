@@ -5,17 +5,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
-#include <iomanip>
-#include <sstream>
+#include <format>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace khanbot {
 namespace {
-
 constexpr auto kRefreshInterval = std::chrono::milliseconds(100);
 constexpr auto kPlainInterval = std::chrono::seconds(10);
 constexpr auto kRateWindow = std::chrono::seconds(10);
@@ -58,31 +58,19 @@ int TerminalColumns() {
 }
 
 std::string FormatFixed(double value, int precision) {
-    std::ostringstream stream;
-    stream << std::fixed << std::setprecision(precision) << value;
-    return stream.str();
+    return std::format("{:.{}f}", value, precision);
 }
 
 std::string FormatDuration(double seconds) {
     const auto total = std::lround(seconds);
     const auto hours = total / 3600;
     const auto minutes = (total % 3600) / 60;
-    std::ostringstream stream;
-    stream << std::setfill('0');
-    if (hours > 0) {
-        stream << hours << ':' << std::setw(2) << minutes;
-    } else {
-        stream << minutes;
-    }
-    stream << ':' << std::setw(2) << total % 60;
-    return stream.str();
+    return hours > 0 ? std::format("{}:{:02}:{:02}", hours, minutes, total % 60)
+                     : std::format("{}:{:02}", minutes, total % 60);
 }
 
-std::string PadLeft(std::string text, int width) {
-    const auto target = static_cast<std::size_t>(width);
-    if (text.size() < target)
-        text.insert(0, target - text.size(), ' ');
-    return text;
+std::string PadLeft(const std::string &text, int width) {
+    return std::format("{:>{}}", text, width);
 }
 
 std::string RenderBar(double fraction, int width) {
@@ -151,6 +139,8 @@ void Progress::Finish() {
 
 void Progress::Run(std::stop_token token) {
     Clock::time_point next_plain_draw = start_ + kPlainInterval;
+    std::mutex wake_mutex;
+    std::condition_variable_any wake;
     while (!token.stop_requested()) {
         const Clock::time_point now = Clock::now();
         samples_.push_back({now, done_.load(std::memory_order_relaxed)});
@@ -164,7 +154,9 @@ void Progress::Run(std::stop_token token) {
             Draw(false);
             next_plain_draw = now + kPlainInterval;
         }
-        std::this_thread::sleep_for(kRefreshInterval);
+
+        std::unique_lock lock(wake_mutex);
+        wake.wait_for(lock, token, kRefreshInterval, [] { return false; });
     }
 }
 

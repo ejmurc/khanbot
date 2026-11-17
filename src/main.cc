@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstddef>
@@ -14,7 +15,6 @@
 #include "src/watch.h"
 
 namespace {
-
 constexpr int kExitOk = 0;
 constexpr int kExitFailure = 1;
 constexpr int kExitIncomplete = 2;
@@ -34,7 +34,7 @@ Options:
 
 Environment:
   KA_IMPERSONATE   libcurl-impersonate target (default: chrome152)
-  KA_KAAS          KAAS session cookie of the account to watch as (watch)
+  KAAS             KAAS session cookie of the account to watch as (watch)
 )";
 
 struct Command {
@@ -59,11 +59,8 @@ void HandleSignal(int) {
 }
 
 const Command *FindCommand(std::string_view name) {
-    for (const Command &command : kCommands) {
-        if (command.name == name)
-            return &command;
-    }
-    return nullptr;
+    const auto *found = std::ranges::find(kCommands, name, &Command::name);
+    return found == std::end(kCommands) ? nullptr : found;
 }
 
 std::optional<khanbot::CommandOptions>
@@ -109,11 +106,11 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i)
         args.emplace_back(argv[i]);
 
-    for (const std::string_view arg : args) {
-        if (arg == "--help" || arg == "-h") {
-            std::cout << kUsage;
-            return kExitOk;
-        }
+    if (std::ranges::any_of(args, [](std::string_view arg) {
+            return arg == "--help" || arg == "-h";
+        })) {
+        std::cout << kUsage;
+        return kExitOk;
     }
     if (args.empty()) {
         std::cerr << kUsage;
