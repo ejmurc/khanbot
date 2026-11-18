@@ -37,6 +37,7 @@ namespace {
 constexpr double kSpeed = 2.0;
 constexpr std::chrono::seconds kTick{20};
 constexpr std::chrono::seconds kMaxElapsed{30};
+constexpr double kPerVideoOverhead = 12.0;
 
 constexpr char kKaasEnv[] = "KAAS";
 constexpr char kKaasCookiePrefix[] = "KAAS=";
@@ -389,6 +390,8 @@ class Watcher {
     const std::atomic<bool> &stop_;
     std::unique_ptr<Journal> journal_;
     std::vector<Video> pending_;
+    double unstarted_seconds_ = 0;
+    std::size_t unstarted_count_ = 0;
     std::size_t watched_ = 0;
     std::size_t skipped_ = 0;
     FailureLog log_;
@@ -478,9 +481,14 @@ void Watcher::WatchVideo(const Video &video, Session &session) {
 
         position = new_position;
         last_sent = now;
+        const double media_left = (duration - position) + unstarted_seconds_;
+        session.progress.SetEta(std::chrono::duration<double>(
+            media_left / kSpeed +
+            kPerVideoOverhead * static_cast<double>(unstarted_count_ + 1)));
         const bool completed = update->item_progress->completed;
         if (stage == Stage::kStart && completed)
             return Complete(video.content_id, false, session);
+        session.progress.SetCurrent(position, duration, kSpeed);
         if (last) {
             if (completed)
                 return Complete(video.content_id, true, session);
@@ -546,12 +554,21 @@ RunStatus Watcher::Run() {
             .total = videos->size(),
             .completed = videos->size() - pending_.size(),
             .extra = 0,
+            .current_label = "Current video",
         });
         Session session{**api, safelist, progress,
                         ApiUrl(options_.base_url, kMutationOperation)};
+        for (const Video &video : pending_)
+            unstarted_seconds_ += static_cast<double>(video.duration);
+        unstarted_count_ = pending_.size();
+        progress.SetEta(std::chrono::duration<double>(
+            unstarted_seconds_ / kSpeed +
+            kPerVideoOverhead * static_cast<double>(unstarted_count_)));
         for (const Video &video : pending_) {
             if (stop_.load() || log_.aborted())
                 break;
+            unstarted_seconds_ -= static_cast<double>(video.duration);
+            --unstarted_count_;
             WatchVideo(video, session);
         }
         progress.Finish();

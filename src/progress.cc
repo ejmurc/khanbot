@@ -33,6 +33,7 @@ constexpr std::string_view kRed = "\x1b[31m";
 constexpr std::string_view kGreen = "\x1b[32m";
 constexpr std::string_view kCyan = "\x1b[36m";
 constexpr std::string_view kClearLine = "\x1b[K";
+constexpr std::string_view kCursorUp = "\x1b[1A";
 constexpr std::string_view kNoStyle = "";
 
 constexpr std::string_view kEighths[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉"};
@@ -127,6 +128,22 @@ void Progress::Fail() {
     failed_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Progress::SetEta(std::chrono::duration<double> remaining) {
+    const Clock::time_point deadline =
+        Clock::now() + std::chrono::duration_cast<Clock::duration>(remaining);
+    eta_deadline_.store(deadline.time_since_epoch().count(),
+                        std::memory_order_relaxed);
+}
+
+void Progress::SetCurrent(double position, double duration, double rate) {
+    std::lock_guard lock(current_mutex_);
+    current_ = CurrentItem{.active = true,
+                           .position = position,
+                           .duration = duration,
+                           .rate = rate,
+                           .at = Clock::now()};
+}
+
 void Progress::Finish() {
     if (finished_)
         return;
@@ -162,9 +179,17 @@ void Progress::Run(std::stop_token token) {
 
 void Progress::Draw(bool final) {
     std::string line = Render(final);
+    const std::string current = final ? std::string() : RenderCurrent();
     if (interactive_) {
         line.insert(0, "\r");
         line += kClearLine;
+        if (!current.empty() || second_line_drawn_) {
+            line += '\n';
+            line += current;
+            line += kClearLine;
+            line += kCursorUp;
+            second_line_drawn_ = !current.empty();
+        }
     }
     if (final || !interactive_)
         line += '\n';
@@ -183,6 +208,14 @@ std::optional<double> Progress::Rate(bool overall, Clock::time_point now,
     return static_cast<double>(done - origin.done) / elapsed;
 }
 
+std::optional<double> Progress::EtaHint(Clock::time_point now) const {
+    const Clock::rep raw = eta_deadline_.load(std::memory_order_relaxed);
+    if (raw == std::numeric_limits<Clock::rep>::min())
+        return std::nullopt;
+    const Clock::time_point deadline{Clock::duration{raw}};
+    return std::max(0.0, std::chrono::duration<double>(deadline - now).count());
+}
+
 std::string Progress::Paint(std::string_view text,
                             std::string_view style) const {
     if (!color_ || style.empty())
@@ -190,6 +223,51 @@ std::string Progress::Paint(std::string_view text,
     std::string painted;
     painted.append(style).append(text).append(kReset);
     return painted;
+}
+
+std::string Progress::RenderCurrent() const {
+    if (!interactive_ || bar_width_ <= 0)
+        return {};
+    CurrentItem item;
+    {
+        std::lock_guard lock(current_mutex_);
+        item = current_;
+    }
+    if (!item.active)
+        return {};
+
+    const double elapsed =
+        std::chrono::duration<double>(Clock::now() - item.at).count();
+    const double position =
+        std::min(item.duration, item.position + elapsed * item.rate);
+    const double fraction = item.duration > 0 ? position / item.duration : 1.0;
+    const std::string percent =
+        PadLeft(FormatFixed(fraction * 100.0, 1) + "%", kPercentWidth);
+    std::string times =
+        FormatDuration(position) + "/" + FormatDuration(item.duration);
+
+    const int columns = TerminalColumns();
+    const int lead = title_width_ > 0 ? title_width_ + 2 : 0;
+    const auto width = [&] {
+        return lead + bar_width_ + 2 + 2 + static_cast<int>(percent.size()) +
+               (times.empty() ? 0 : 2 + static_cast<int>(times.size()));
+    };
+    if (width() > columns - 1)
+        times.clear();
+    if (width() > columns - 1)
+        return {};
+
+    std::string line;
+    if (title_width_ > 0) {
+        std::string label = options_.current_label;
+        label.resize(static_cast<std::size_t>(title_width_), ' ');
+        line += Paint(label, kBold) + "  ";
+    }
+    line += Paint("[", kDim) + Paint(RenderBar(fraction, bar_width_), kCyan) +
+            Paint("]", kDim) + "  " + Paint(percent, kBold);
+    if (!times.empty())
+        line += "  " + Paint(times, kDim);
+    return line;
 }
 
 std::string Progress::Render(bool final) const {
@@ -210,6 +288,8 @@ std::string Progress::Render(bool final) const {
         time_text = "took " + FormatDuration(elapsed);
     } else if (done >= options_.total) {
         time_text = "ETA 0:00";
+    } else if (const std::optional<double> hint = EtaHint(now)) {
+        time_text = "ETA " + FormatDuration(*hint);
     } else if (rate.has_value()) {
         const double eta = static_cast<double>(options_.total - done) / *rate;
         time_text =
@@ -231,7 +311,7 @@ std::string Progress::Render(bool final) const {
         {PadLeft(rate.has_value() ? FormatFixed(*rate, 1) + "/s" : "--/s",
                  kRateWidth),
          kDim, 3});
-    segments.push_back({time_text, kDim, 1});
+    segments.push_back({time_text, kDim, 0});
     segments.push_back(
         {FormatCount(extra) + " " + options_.extra_label, kNoStyle, 2});
     if (failed > 0) {
@@ -263,6 +343,9 @@ std::string Progress::Render(bool final) const {
             break;
         }
     }
+
+    title_width_ = static_cast<int>(title_size);
+    bar_width_ = bar_width;
 
     std::string line;
     const auto append = [&line](const std::string &piece) {
